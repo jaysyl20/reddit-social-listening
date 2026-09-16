@@ -1,8 +1,27 @@
 import streamlit as st
+
+from dashboard_utils import (
+    build_category_summary,
+    build_sentiment_pie_chart,
+    build_sentiment_status_counts,
+    build_sentiment_summary,
+    build_theme_summary,
+)
+from export_utils import (
+    dataframe_to_excel_bytes,
+    export_file_names,
+    select_export_dataframe,
+)
 from reddit_scraper import (
     create_reddit_client,
     run_reddit_scraper,
     dataframe_to_csv_bytes
+)
+from sentiment_analysis import (
+    DEFAULT_SENTIMENT_MODEL,
+    DEFAULT_SENTIMENT_MAX_WORKERS,
+    create_openai_client,
+    enrich_dataframe_with_sentiment,
 )
 
 
@@ -124,7 +143,29 @@ else:
 
 
 # ==============================
-# 4. User inputs
+# 4. OpenAI sentiment settings
+# ==============================
+
+st.sidebar.header("OpenAI Sentiment Settings")
+
+openai_api_key = get_streamlit_secret("OPENAI_API_KEY")
+saved_sentiment_model = get_streamlit_secret("OPENAI_SENTIMENT_MODEL")
+
+if openai_api_key:
+    st.sidebar.success("OpenAI API key loaded from Streamlit secrets.")
+else:
+    st.sidebar.info(
+        "Add OPENAI_API_KEY to Streamlit secrets to enable sentiment analysis."
+    )
+
+sentiment_model = st.sidebar.text_input(
+    "Sentiment Model",
+    value=saved_sentiment_model or DEFAULT_SENTIMENT_MODEL,
+)
+
+
+# ==============================
+# 5. User inputs
 # ==============================
 
 st.header("Search Setup")
@@ -186,7 +227,7 @@ with col2:
 
 
 # ==============================
-# 5. Runtime explanation
+# 6. Runtime explanation
 # ==============================
 
 with st.expander("What do the runtime modes mean?"):
@@ -200,7 +241,7 @@ with st.expander("What do the runtime modes mean?"):
 
 
 # ==============================
-# 6. Run scraper
+# 7. Run scraper
 # ==============================
 
 run_button = st.button("Run Reddit Search", type="primary")
@@ -246,6 +287,8 @@ if run_button:
         progress_message.info(message)
 
     try:
+        st.session_state.pop("reddit_sentiment_df", None)
+
         reddit = create_reddit_client(
             client_id=client_id,
             client_secret=client_secret,
@@ -272,24 +315,121 @@ if run_button:
 
 
 # ==============================
-# 7. Show and download results
+# 8. Show, analyze, and download results
 # ==============================
 
 if "reddit_results_df" in st.session_state:
     df = st.session_state["reddit_results_df"]
+    sentiment_df = st.session_state.get("reddit_sentiment_df")
+    export_df = select_export_dataframe(df, sentiment_df)
 
     st.header("Results Preview")
 
     if df.empty:
         st.warning("No matching comments were found for this search.")
+        st.info("The export is still available and will contain the expected column headers.")
     else:
-        st.dataframe(df.head(100), use_container_width=True)
+        st.dataframe(export_df.head(100), width="stretch")
 
-        csv_data = dataframe_to_csv_bytes(df)
+        st.header("Sentiment Analysis")
 
+        if openai_api_key:
+            if sentiment_df is None:
+                sentiment_button_label = "Run Sentiment Analysis"
+            else:
+                sentiment_button_label = "Rerun Sentiment Analysis"
+
+            if st.button(sentiment_button_label):
+                progress_message = st.empty()
+
+                def update_sentiment_progress(message):
+                    progress_message.info(message)
+
+                try:
+                    openai_client = create_openai_client(openai_api_key)
+
+                    with st.spinner("Running sentiment analysis..."):
+                        sentiment_df = enrich_dataframe_with_sentiment(
+                            df,
+                            client=openai_client,
+                            model=sentiment_model.strip() or DEFAULT_SENTIMENT_MODEL,
+                            progress_callback=update_sentiment_progress,
+                            max_workers=DEFAULT_SENTIMENT_MAX_WORKERS,
+                        )
+
+                    st.session_state["reddit_sentiment_df"] = sentiment_df
+                    export_df = sentiment_df
+                    st.success(
+                        f"Sentiment analysis complete for {len(sentiment_df)} comments."
+                    )
+                except Exception:
+                    st.error("Something went wrong while running sentiment analysis.")
+        else:
+            st.info("Sentiment analysis is unavailable until OPENAI_API_KEY is configured in Streamlit secrets.")
+
+    if sentiment_df is not None:
+        st.header("Sentiment Dashboard")
+        status_counts = build_sentiment_status_counts(sentiment_df)
+        summary_df = build_sentiment_summary(sentiment_df)
+
+        metric_columns = st.columns(6)
+        metric_columns[0].metric("Positive", int(summary_df.loc[summary_df["Sentiment"] == "Positive", "Mentions"].iloc[0]))
+        metric_columns[1].metric("Negative", int(summary_df.loc[summary_df["Sentiment"] == "Negative", "Mentions"].iloc[0]))
+        metric_columns[2].metric("Neutral", int(summary_df.loc[summary_df["Sentiment"] == "Neutral", "Mentions"].iloc[0]))
+        metric_columns[3].metric("Analyzed", status_counts["analyzed"])
+        metric_columns[4].metric("Skipped", status_counts["skipped"])
+        metric_columns[5].metric("Failed", status_counts["failed"])
+
+        if status_counts["analyzed"] == 0:
+            st.warning(
+                "Sentiment analysis completed, but no rows were successfully analyzed. "
+                "The enriched export remains available."
+            )
+        else:
+            st.altair_chart(build_sentiment_pie_chart(summary_df))
+
+            st.subheader("Category Breakdown")
+            st.dataframe(
+                build_category_summary(sentiment_df),
+                width="stretch",
+                hide_index=True,
+            )
+
+            theme_columns = st.columns(2)
+            with theme_columns[0]:
+                st.subheader("Top Negative Themes")
+                st.dataframe(
+                    build_theme_summary(sentiment_df, "Negative"),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+            with theme_columns[1]:
+                st.subheader("Top Positive Themes")
+                st.dataframe(
+                    build_theme_summary(sentiment_df, "Positive"),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+    st.subheader("Downloads")
+    csv_data = dataframe_to_csv_bytes(export_df)
+    excel_data = dataframe_to_excel_bytes(export_df)
+    file_names = export_file_names(sentiment_df)
+
+    download_columns = st.columns(2)
+    with download_columns[0]:
         st.download_button(
             label="Download CSV",
             data=csv_data,
-            file_name="reddit_social_listening_export.csv",
-            mime="text/csv"
+            file_name=file_names["csv"],
+            mime="text/csv",
+        )
+
+    with download_columns[1]:
+        st.download_button(
+            label="Download Excel",
+            data=excel_data,
+            file_name=file_names["excel"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )

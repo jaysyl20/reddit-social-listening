@@ -15,9 +15,9 @@ def create_reddit_client(client_id, client_secret, user_agent):
     Creates and returns a Reddit API client.
     """
     return praw.Reddit(
-    	client_id='YlONgHYYAgjib1xg0Ddwzg',
-    	client_secret='0vtLqCsqtjm8IMmcw7-1IefJrf7M_g',
-    	user_agent='windows:social_listening_tool:v1.0 (by /u/JayPublicis)'
+        client_id=client_id,
+        client_secret=client_secret,
+        user_agent=user_agent,
     )
 
 

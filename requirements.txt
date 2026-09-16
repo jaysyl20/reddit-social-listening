@@ -1,3 +1,5 @@
 streamlit
 praw
 pandas
+openai
+openpyxl
